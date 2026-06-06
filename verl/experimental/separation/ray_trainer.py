@@ -491,6 +491,91 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self.reward_extra_infos_dict = reward_extra_infos_dict
         return batch
 
+    @staticmethod
+    def _normalize_reward_category(category) -> str:
+        category = str(category)
+        if category == "science/AIME25" or "aime" in category.lower() or "math" in category.lower():
+            return "math"
+        if category == "if" or "ifeval" in category.lower():
+            return "if"
+        return category.replace("/", "_")
+
+    @classmethod
+    def _compute_reward_extra_metrics(cls, reward_extra_infos_dict: dict) -> dict[str, float]:
+        categories = reward_extra_infos_dict.get("category")
+        if categories is None:
+            return {}
+
+        def _values(name):
+            values = reward_extra_infos_dict.get(name)
+            return values.tolist() if hasattr(values, "tolist") else values
+
+        def _to_float(value, default=0.0):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        scores = _values("score") or _values("acc")
+        lengths = _values("valid_response_length")
+        cot_lengths = _values("cot_length")
+        answer_lengths = _values("answer_length")
+        format_follows = _values("format_follow")
+        overlong_ratios = _values("overlong_ratio")
+        categories = _values("category")
+
+        grouped: dict[str, dict[str, list[float]]] = {}
+        all_group: dict[str, list[float]] = {}
+
+        def _append(bucket: dict[str, list[float]], key: str, value: float) -> None:
+            bucket.setdefault(key, []).append(value)
+
+        for i, category in enumerate(categories):
+            cat = cls._normalize_reward_category(category)
+            cat_bucket = grouped.setdefault(cat, {})
+
+            response_length = _to_float(lengths[i]) if lengths is not None and i < len(lengths) else None
+            format_follow = _to_float(format_follows[i], 1.0) if format_follows is not None and i < len(format_follows) else 1.0
+
+            if scores is not None and i < len(scores):
+                score = _to_float(scores[i])
+                _append(cat_bucket, "acc", score)
+                _append(all_group, "acc", score)
+            if response_length is not None:
+                _append(cat_bucket, "length", response_length)
+                _append(all_group, "length", response_length)
+            if cot_lengths is not None and i < len(cot_lengths):
+                cot_length = _to_float(cot_lengths[i])
+                if format_follow <= 0.0 and response_length is not None:
+                    cot_length = response_length
+                    _append(cat_bucket, "format_fail_length", response_length)
+                    _append(all_group, "format_fail_length", response_length)
+                _append(cat_bucket, "cot_length", cot_length)
+                _append(all_group, "cot_length", cot_length)
+            if answer_lengths is not None and i < len(answer_lengths):
+                answer_length = _to_float(answer_lengths[i])
+                if format_follow <= 0.0 and response_length is not None:
+                    answer_length = 0.0
+                _append(cat_bucket, "answer_length", answer_length)
+                _append(all_group, "answer_length", answer_length)
+            if format_follows is not None and i < len(format_follows):
+                _append(cat_bucket, "format_follow", format_follow)
+                _append(all_group, "format_follow", format_follow)
+            if overlong_ratios is not None and i < len(overlong_ratios):
+                overlong_ratio = _to_float(overlong_ratios[i])
+                _append(cat_bucket, "overlong_ratio", overlong_ratio)
+                _append(all_group, "overlong_ratio", overlong_ratio)
+
+        metrics = {}
+        for metric_name, values in all_group.items():
+            if values:
+                metrics[f"global/{metric_name}"] = sum(values) / len(values)
+        for cat, cat_metrics in grouped.items():
+            for metric_name, values in cat_metrics.items():
+                if values:
+                    metrics[f"global/{cat}/{metric_name}"] = sum(values) / len(values)
+        return metrics
+
     def _fit_compute_log_prob(self, batch: DataProto) -> DataProto:
         metrics = self.metrics
         timing_raw = self.timing_raw
@@ -718,6 +803,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
         # collect metrics
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        metrics.update(self._compute_reward_extra_metrics(self.reward_extra_infos_dict))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         # TODO: implement actual tflpo and theoretical tflpo
         n_gpus = self.resource_pool_manager.get_n_gpus()
